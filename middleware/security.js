@@ -36,6 +36,15 @@ exports.registerGuard = (req, res, next) => {
     delete body[k];
   });
 
+  // Blushway is women-only: sign up needs the confirmation
+  if (body.confirmFemale !== true) {
+    return res.status(400).json({
+      success: false,
+      message: 'Blushway is for women only. Please confirm that you are a woman to join.',
+    });
+  }
+  delete body.confirmFemale;
+
   const pw = String(body.password || '');
   if (pw.length < 8 || !/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw)) {
     return res.status(400).json({

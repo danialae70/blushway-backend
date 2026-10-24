@@ -1,14 +1,29 @@
+const mongoose = require('mongoose');
 const Ride = require('../models/Ride');
 const { Wallet, WalletTx } = require('../models/Wallet');
 const User = require('../models/User');
 const Profile = require('../models/Profile');
+const { Vehicle } = require('../models/ExtraModels');
 const { trip, fareFor, CATS } = require('../utils/fare');
 const { rideCard } = require('../utils/rideCard');
 
-const PERSON_FIELDS = 'name phone rating';
+const PERSON_FIELDS = 'name rating';
 const ACTIVE_STATUSES = ['accepted', 'in_progress'];
 const REQUEST_TTL_MS = 10 * 60 * 1000; // unaccepted requests expire after 10 minutes
 const freshSince = () => new Date(Date.now() - REQUEST_TTL_MS);
+
+// Cancel history, used for the "3 give-backs in a day" rules
+const CancelLog = mongoose.models.CancelLog || mongoose.model('CancelLog', new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+  role: String,
+  ride: { type: mongoose.Schema.Types.ObjectId, ref: 'Ride' },
+  reason: String,
+}, { timestamps: true }));
+
+const REASONS = ['Changed my plans', 'Driver is too far', 'Waiting too long', 'Found another ride',
+  'Passenger not at pickup', 'Vehicle problem', 'Pickup is too far', 'Wrong destination', 'Safety concern', 'Other'];
+const cleanReason = (v) => (REASONS.includes(v) ? v : 'Other');
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 // Company keeps 30% of every fare (cash rides)
 const COMMISSION_RATE = 0.3;
@@ -73,18 +88,36 @@ exports.bookRide = async (req, res) => {
   }
 };
 
-// PATCH /api/rides/:id/cancel
+// PATCH /api/rides/:id/cancel  (before pickup)
 exports.cancelRide = async (req, res) => {
   try {
+    const before = await Ride.findOne({
+      _id: req.params.id, rider: req.user._id, status: { $in: ['requested', 'accepted'] },
+    });
+    if (!before) {
+      return res.status(409).json({ success: false, message: 'This ride cannot be cancelled.' });
+    }
+    const reason = cleanReason(req.body && req.body.reason);
     const ride = await Ride.findOneAndUpdate(
-      { _id: req.params.id, rider: req.user._id, status: { $in: ['requested', 'accepted'] } },
-      { status: 'cancelled', cancelledBy: 'rider' },
+      { _id: before._id, status: before.status },
+      { status: 'cancelled', cancelledBy: 'rider', cancellationReason: reason },
       { new: true }
     );
     if (!ride) {
       return res.status(409).json({ success: false, message: 'This ride cannot be cancelled.' });
     }
-    return res.json({ success: true, ride });
+
+    let warning = null;
+    if (before.status === 'accepted') {
+      await CancelLog.create({ user: req.user._id, role: 'rider', ride: ride._id, reason });
+      const n = await CancelLog.countDocuments({
+        user: req.user._id, role: 'rider', createdAt: { $gte: new Date(Date.now() - DAY_MS) },
+      });
+      if (n >= 3) {
+        warning = `You have cancelled ${n} accepted rides in the last 24 hours. Please only book when you are ready to ride.`;
+      }
+    }
+    return res.json({ success: true, ride, warning });
   } catch (err) {
     return serverError(res, err, 'cancelRide');
   }
@@ -179,6 +212,26 @@ exports.acceptRide = async (req, res) => {
       return res
         .status(409)
         .json({ success: false, message: 'Finish your current ride first.' });
+    }
+
+    const gaveBack = await CancelLog.find({
+      user: req.user._id, role: 'driver', createdAt: { $gte: new Date(Date.now() - DAY_MS) },
+    }).sort({ createdAt: -1 }).limit(3).lean();
+    if (gaveBack.length >= 3) {
+      const waitMs = new Date(gaveBack[0].createdAt).getTime() + 60 * 60 * 1000 - Date.now();
+      if (waitMs > 0) {
+        return res.status(403).json({
+          success: false,
+          message: `You gave back 3 rides today. You can accept new rides again in ${Math.ceil(waitMs / 60000)} minutes.`,
+        });
+      }
+    }
+
+    if (!(await Vehicle.exists({ user: req.user._id }))) {
+      return res.status(403).json({
+        success: false,
+        message: 'Please add your vehicle details (type, model, color and number plate) on your driver home page first.',
+      });
     }
 
     const prof = await Profile.findOne({ user: req.user._id }).select('driverStatus').lean();
@@ -362,6 +415,7 @@ exports.updateLocation = async (req, res) => {
 // PATCH /api/rides/:id/driver-cancel - driver gives the ride back (only before pickup)
 exports.driverCancel = async (req, res) => {
   try {
+    const reason = cleanReason(req.body && req.body.reason);
     const ride = await Ride.findOneAndUpdate(
       { _id: req.params.id, driver: req.user._id, status: 'accepted' },
       {
@@ -377,10 +431,67 @@ exports.driverCancel = async (req, res) => {
     if (!ride) {
       return res.status(409).json({ success: false, message: 'You can only give a ride back before pickup.' });
     }
+    await CancelLog.create({ user: req.user._id, role: 'driver', ride: ride._id, reason });
+    const n = await CancelLog.countDocuments({
+      user: req.user._id, role: 'driver', createdAt: { $gte: new Date(Date.now() - DAY_MS) },
+    });
     const io = req.app.get('io');
     if (io) io.to('drivers').emit('new-ride-request', rideCard(ride));
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      warning: n >= 3 ? 'That was your 3rd give-back today. You cannot accept new rides for 1 hour.' : null,
+    });
   } catch (err) {
     return serverError(res, err, 'driverCancel');
+  }
+};
+
+// PATCH /api/rides/:id/end-early - rider or driver ends a trip that is already in progress
+exports.endTripEarly = async (req, res) => {
+  try {
+    const uid = req.user._id;
+    const existing = await Ride.findOne({
+      _id: req.params.id, status: 'in_progress', $or: [{ rider: uid }, { driver: uid }],
+    }).select('rider driver');
+    if (!existing) {
+      return res.status(409).json({ success: false, message: 'This trip cannot be ended.' });
+    }
+    const by = String(existing.rider) === String(uid) ? 'rider' : 'driver';
+    const reason = cleanReason(req.body && req.body.reason);
+    // No commission is charged when a trip ends early
+    const ride = await Ride.findOneAndUpdate(
+      { _id: existing._id, status: 'in_progress' },
+      { status: 'cancelled', cancelledBy: by, cancellationReason: `During trip: ${reason}` },
+      { new: true }
+    );
+    if (!ride) {
+      return res.status(409).json({ success: false, message: 'This trip cannot be ended.' });
+    }
+    console.log(`[rides] trip ${ride._id} ended early by ${by}: ${reason}`);
+    return res.json({ success: true });
+  } catch (err) {
+    return serverError(res, err, 'endTripEarly');
+  }
+};
+
+// GET /api/rides/admin/early-ended - for the admin page
+exports.adminEarlyEnded = async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Admin access only.' });
+    }
+    const rides = await Ride.find({
+      status: 'cancelled',
+      $or: [{ cancellationReason: /^During trip:/ }, { cancellationReason: /Safety concern/ }],
+    }).sort({ updatedAt: -1 }).limit(20).populate('rider', 'name').populate('driver', 'name').lean();
+    return res.json({
+      success: true,
+      rides: rides.map((r) => ({
+        id: r._id, rider: r.rider && r.rider.name, driver: r.driver && r.driver.name,
+        by: r.cancelledBy, reason: r.cancellationReason, at: r.updatedAt, pickup: r.pickup && r.pickup.address,
+      })),
+    });
+  } catch (err) {
+    return serverError(res, err, 'adminEarlyEnded');
   }
 };

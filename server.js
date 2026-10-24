@@ -23,6 +23,7 @@ const adminRoutes   = require('./routes/admin');
 const socketHandler = require('./socket');
 const kycRoutes     = require('./routes/kycRoutes');
 const communityRoutes = require('./routes/communityRoutes');
+const extraRoutes     = require('./routes/extraRoutes');
 const sosRoutes     = require('./routes/sosRoutes');
 const Profile       = require('./models/Profile');
 const protect       = require('./middleware/auth');
@@ -70,7 +71,7 @@ const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
   message: 'Too many requests.',
-  skip: (req) => req.path.startsWith('/rides') || req.path.startsWith('/sos') || req.path.startsWith('/community')
+  skip: (req) => req.path.startsWith('/rides') || req.path.startsWith('/sos') || req.path.startsWith('/community') || req.path.startsWith('/extra')
 });
 app.use('/api/', limiter);
 
@@ -100,6 +101,7 @@ app.use('/api/rides',    rideRoutes);
 app.use('/api/wallet',   walletRoutes);
 app.use('/api/kyc',      kycRoutes);
 app.use('/api/community', communityRoutes);
+app.use('/api/extra',     extraRoutes);
 app.use('/api/sos',      sosRoutes);
 app.use('/api/drivers',  driverRoutes);
 app.use('/api/users',    userRoutes);

@@ -1,7 +1,7 @@
 const Ride = require('../models/Ride');
 const { rideCard } = require('../utils/rideCard');
 
-const ACCEPT_TIMEOUT_MS = 3 * 60 * 1000;  // driver silent for 3 minutes -> ride goes back to the pool
+const ACCEPT_TIMEOUT_MS = 10 * 60 * 1000; // driver silent for 10 minutes -> ride goes back to the pool
 const REQUEST_TTL_MS = 10 * 60 * 1000;    // nobody accepted for 10 minutes -> cancelled
 
 module.exports = (io) => {

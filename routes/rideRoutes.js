@@ -57,6 +57,9 @@ router.patch('/:id/driver-cancel', protect, requireDriver, idRule, ctrl.driverCa
 
 // ---- rider cancel ------------------------------------------------------------
 router.patch('/:id/cancel', protect, idRule, ctrl.cancelRide);
+router.patch('/:id/end-early', protect, idRule, ctrl.endTripEarly);
+
+router.get('/admin/early-ended', protect, ctrl.adminEarlyEnded);
 
 // ---- shared ----------------------------------------------------------------
 router.get('/:id', protect, idRule, ctrl.getRideById);
